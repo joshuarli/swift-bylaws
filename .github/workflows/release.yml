@@ -39,7 +39,7 @@ jobs:
     name: macOS arm64 CLI
     needs: preflight
     runs-on: xcode-27
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     defaults:
@@ -50,12 +50,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build only the CLI, optimized for size
+      - name: Build only the CLI, optimized for runtime performance
         run: |
           test "$(uname -m)" = arm64
           swift --version
+          # Release already enables -O and whole-module optimization.
+          # Add cross-module optimization, full LTO and Apple M1 code generation.
+          # Do not use -Ounchecked: preserve Swift's runtime safety checks.
           swift build -c release --product bylaws --arch arm64 \
-            -Xswiftc -Osize -Xlinker -dead_strip
+            --experimental-lto-mode full \
+            -Xswiftc -cross-module-optimization \
+            -Xswiftc -target-cpu -Xswiftc apple-m1 \
+            -Xcc -mcpu=apple-m1
 
       - name: Strip, sign, and package one arm64 executable
         run: |
