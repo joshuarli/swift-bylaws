@@ -1,582 +1,138 @@
-name: Release
+name: release
 
 on:
   workflow_dispatch:
-    inputs:
-      skip_cache:
-        description: Build without restoring or saving cached files
-        default: false
-        type: boolean
-      version:
-        description: Version without the leading v
-        required: true
-        type: string
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: release
+  group: release-${{ github.sha }}
   cancel-in-progress: false
 
 env:
+  REPOSITORY: ${{ github.repository }}
+  TRIPLE: aarch64-apple-darwin
   BYLAWS_BUILD_PLUGIN_FROM_SOURCE: "1"
-  RELEASE_TAG: ${{ format('v{0}', inputs.version) }}
 
 jobs:
   preflight:
-    name: Check release settings
-    runs-on: ubuntu-latest
+    name: Default branch only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
     steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - parallel:
-          - name: Check release source and version
-            run: |
-              if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
-                echo "::error::Run the release from the main branch."
-                exit 1
-              fi
-              if [[ ! "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[A-Za-z]+[0-9]*)?$ ]]; then
-                echo "::error::Use a version such as 0.2.0 or 0.2.0-rc1."
-                exit 1
-              fi
-              if git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}"; then
-                echo "::error::The ${RELEASE_TAG} tag exists."
-                exit 1
-              fi
-          - name: Check publisher settings
-            env:
-              RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
-              RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-              BCR_PUBLISH_ENABLED: ${{ vars.BCR_PUBLISH_ENABLED }}
-              BCR_PUBLISH_TOKEN: ${{ secrets.BCR_PUBLISH_TOKEN }}
-            run: |
-              if [ -z "${RELEASE_APP_ID}" ]; then
-                echo "::error::Add the RELEASE_APP_ID repository secret before you publish a release."
-                exit 1
-              fi
-              if [ -z "${RELEASE_APP_PRIVATE_KEY}" ]; then
-                echo "::error::Add the RELEASE_APP_PRIVATE_KEY repository secret before you publish a release."
-                exit 1
-              fi
-              if [[ "${RELEASE_TAG}" != *-* ]] && [ "${BCR_PUBLISH_ENABLED}" = "true" ] && [ -z "${BCR_PUBLISH_TOKEN}" ]; then
-                echo "::error::Add the BCR_PUBLISH_TOKEN repository secret or set BCR_PUBLISH_ENABLED to false."
-                exit 1
-              fi
-
-  prepare-source:
-    name: Prepare release source
-    needs: preflight
-    runs-on: ubuntu-latest
-    outputs:
-      source_branch: ${{ steps.source.outputs.branch }}
-      source_revision: ${{ steps.source.outputs.revision }}
-    steps:
-      - name: Create release app token
-        id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
-        with:
-          app-id: ${{ secrets.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-      - name: Set release version
-        id: source
+      - name: Refuse dispatches outside the default branch
         env:
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          VERSION_FILE="Sources/BylawsRunner/Project/BylawsVersion.swift"
-          SOURCE_BRANCH="release-work/${RELEASE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          git switch -c "${SOURCE_BRANCH}"
-          sed -i -E \
-            's/(package static let current = ")[^"]+(".*)/\1'"${VERSION}"'\2/' \
-            "${VERSION_FILE}"
-          FOUND_VERSION=$(sed -n -E \
-            's/.*package static let current = "([^"]+)".*/\1/p' \
-            "${VERSION_FILE}")
-          if [ "${FOUND_VERSION}" != "${VERSION}" ]; then
-            echo "::error::Cannot set BylawsVersion.current to ${VERSION}. Check ${VERSION_FILE}."
+          default_branch=$(gh api "repos/$REPOSITORY" --jq '.default_branch')
+          if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF" != "refs/heads/$default_branch" ]]; then
+            echo "Releases must run from refs/heads/$default_branch, not $GITHUB_REF" >&2
             exit 1
           fi
-          if ! git diff --quiet -- "${VERSION_FILE}"; then
-            git config user.name "${APP_SLUG}[bot]"
-            git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
-            git add "${VERSION_FILE}"
-            git commit -m "Prepare ${RELEASE_TAG}"
-          fi
-          git push origin "HEAD:refs/heads/${SOURCE_BRANCH}"
-          echo "branch=${SOURCE_BRANCH}" >> "${GITHUB_OUTPUT}"
-          echo "revision=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
-  verify:
-    name: Run tests
-    needs: prepare-source
+  build:
+    name: macOS arm64 CLI
+    needs: preflight
+    runs-on: xcode-27
+    timeout-minutes: 60
     permissions:
       contents: read
-      pull-requests: read
-    uses: ./.github/workflows/ci.yml
-    with:
-      checkout_ref: ${{ needs.prepare-source.outputs.source_revision }}
-      run_package_checks: true
-      skip_cache: ${{ inputs.skip_cache }}
-
-  documentation:
-    name: Check documentation
-    needs: prepare-source
-    permissions:
-      contents: read
-    uses: ./.github/workflows/docs.yml
-    with:
-      checkout_ref: ${{ needs.prepare-source.outputs.source_revision }}
-      upload_pages: ${{ !contains(inputs.version, '-') }}
-      skip_cache: ${{ inputs.skip_cache }}
-
-  build-macos:
-    name: Build macOS tools
-    needs: [prepare-source, verify]
-    runs-on: macos-26
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
     steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.prepare-source.outputs.source_revision }}
-      - name: Restore Swift builds
-        id: cache
-        uses: ./.github/actions/swift-cache
-        with:
-          scope: release-macos-universal
-          skip-cache: ${{ inputs.skip_cache }}
-      - name: Build each architecture
-        run: |
-          swift build -c release --product bylaws --arch arm64
-          swift build -c release --product bylaws-lsp --arch arm64
-          swift build -c release --product bylaws --arch x86_64
-          swift build -c release --product bylaws-lsp --arch x86_64
-      - parallel:
-          - name: Save Swift build
-            if: steps.cache.outputs.save-needed == 'true'
-            uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-            with:
-              path: .build
-              key: ${{ steps.cache.outputs.primary-key }}
-          - name: Stage files
-            run: |
-              mkdir -p stage/bin
-              lipo -create \
-                .build/arm64-apple-macosx/release/bylaws \
-                .build/x86_64-apple-macosx/release/bylaws \
-                -output stage/bin/bylaws
-              lipo -create \
-                .build/arm64-apple-macosx/release/bylaws-lsp \
-                .build/x86_64-apple-macosx/release/bylaws-lsp \
-                -output stage/bin/bylaws-lsp
-              cp -R Distribution/BazelSupport/. stage/
-      - name: Create archive
-        run: COPYFILE_DISABLE=1 tar -czf bylaws-macos.tar.gz -C stage .
-      - name: Test archive
-        run: |
-          mkdir smoke
-          tar -xzf bylaws-macos.tar.gz -C smoke
-          Scripts/test-release.swift \
-            smoke/bin/bylaws \
-            "${RELEASE_TAG#v}" \
-            smoke/bin/bylaws-lsp
-      - name: Upload macOS binary
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: bylaws-macos
-          path: bylaws-macos.tar.gz
+          persist-credentials: false
 
-  build-linux:
-    name: Build Linux tools
-    needs: [prepare-source, verify]
-    runs-on: ubuntu-latest
-    container: swift:6.3-jammy
-    steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.prepare-source.outputs.source_revision }}
-      - name: Restore Swift builds
-        id: cache
-        uses: ./.github/actions/swift-cache
-        with:
-          scope: release-linux-static
-          skip-cache: ${{ inputs.skip_cache }}
-      - name: Build tools
+      - name: Build only the CLI, optimized for size
         run: |
-          swift build -c release --product bylaws --static-swift-stdlib
-          swift build -c release --product bylaws-lsp --static-swift-stdlib
-      - parallel:
-          - name: Save Swift build
-            if: steps.cache.outputs.save-needed == 'true'
-            uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-            with:
-              path: .build
-              key: ${{ steps.cache.outputs.primary-key }}
-          - name: Stage files
-            run: |
-              mkdir -p stage/bin
-              cp .build/release/bylaws stage/bin/bylaws
-              cp .build/release/bylaws-lsp stage/bin/bylaws-lsp
-              cp -R Distribution/BazelSupport/. stage/
-      - name: Create archive
-        run: tar -czf bylaws-linux.tar.gz -C stage .
-      - name: Test archive
-        run: |
-          mkdir smoke
-          tar -xzf bylaws-linux.tar.gz -C smoke
-          Scripts/test-release.swift \
-            smoke/bin/bylaws \
-            "${RELEASE_TAG#v}" \
-            smoke/bin/bylaws-lsp
-      - name: Upload Linux binary
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: bylaws-linux
-          path: bylaws-linux.tar.gz
+          test "$(uname -m)" = arm64
+          swift --version
+          swift build -c release --product bylaws --arch arm64 \
+            -Xswiftc -Osize -Xlinker -dead_strip
 
-  artifactbundle:
-    name: Build plugin artifact bundle
-    needs: [prepare-source, build-macos, build-linux]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.prepare-source.outputs.source_revision }}
-      - name: Download release binaries
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: bylaws-{macos,linux}
-          merge-multiple: true
-          path: release-artifacts
-      - name: Build artifact bundle
+      - name: Strip, sign, and package one arm64 executable
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          mkdir extracted
-          tar -xzOf release-artifacts/bylaws-macos.tar.gz ./bin/bylaws \
-            > extracted/bylaws-macos
-          tar -xzOf release-artifacts/bylaws-macos.tar.gz ./bin/bylaws-lsp \
-            > extracted/bylaws-lsp-macos
-          tar -xzOf release-artifacts/bylaws-linux.tar.gz ./bin/bylaws \
-            > extracted/bylaws-linux
-          tar -xzOf release-artifacts/bylaws-linux.tar.gz ./bin/bylaws-lsp \
-            > extracted/bylaws-lsp-linux
-          Scripts/make-plugin-artifact-bundle.swift \
-            "${VERSION}" \
-            bylaws.artifactbundle \
-            "bylaws-cli::bylaws::macos::extracted/bylaws-macos::arm64-apple-macosx,x86_64-apple-macosx" \
-            "bylaws-cli::bylaws::linux::extracted/bylaws-linux::x86_64-unknown-linux-gnu" \
-            "bylaws-lsp::bylaws-lsp::macos::extracted/bylaws-lsp-macos::arm64-apple-macosx,x86_64-apple-macosx" \
-            "bylaws-lsp::bylaws-lsp::linux::extracted/bylaws-lsp-linux::x86_64-unknown-linux-gnu"
-          zip -qr --symlinks bylaws.artifactbundle.zip bylaws.artifactbundle
-      - name: Upload artifact bundle
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: bylaws-artifactbundle
-          path: bylaws.artifactbundle.zip
+          binary="$(swift build -c release --arch arm64 --show-bin-path)/bylaws"
+          test -x "$binary"
+          mkdir -p stage out
+          install -m 755 "$binary" stage/bylaws
+          strip -S -x stage/bylaws
+          codesign --force --sign - --timestamp=none stage/bylaws
+          codesign --verify --strict stage/bylaws
+          test "$(lipo -archs stage/bylaws)" = arm64
+          file stage/bylaws
+          ls -lh stage/bylaws
+          (cd stage && COPYFILE_DISABLE=1 zip -q -9 -X "../out/bylaws-$TRIPLE.zip" bylaws)
+          test "$(unzip -Z -1 "out/bylaws-$TRIPLE.zip")" = bylaws
 
-  prepare-release:
-    name: Commit and tag release
-    needs: [prepare-source, documentation, artifactbundle]
-    runs-on: macos-26
-    permissions:
-      contents: write
-    outputs:
-      revision: ${{ steps.release-commit.outputs.revision }}
-    steps:
-      - parallel:
-          - name: Select Xcode
-            uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
-            with:
-              xcode-version: 26.6
-          - name: Create release app token
-            id: app-token
-            uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
-            with:
-              app-id: ${{ secrets.RELEASE_APP_ID }}
-              private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      - name: Check out release source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Smoke-test the exact ZIP payload
+        run: |
+          mkdir -p smoke
+          unzip -q "out/bylaws-$TRIPLE.zip" -d smoke
+          version="$(sed -n 's/.*current = "\([^"]*\)".*/\1/p' Sources/BylawsRunner/Project/BylawsVersion.swift)"
+          test -n "$version"
+          swift Scripts/test-release.swift "$PWD/smoke/bylaws" "$version"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          fetch-depth: 0
-          ref: ${{ needs.prepare-source.outputs.source_revision }}
-          token: ${{ steps.app-token.outputs.token }}
-      - name: Download release artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-      - name: Update package manifest
-        run: |
-          CHECKSUM=$(swift package compute-checksum \
-            bylaws-artifactbundle/bylaws.artifactbundle.zip)
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/bylaws.artifactbundle.zip"
-          swift run PackageManifestSync \
-            --plugin-url "${URL}" --plugin-checksum "${CHECKSUM}"
-      - name: Verify plugin artifact
-        run: |
-          VERSION="${RELEASE_TAG#v}"
-          EXPECTED_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/bylaws.artifactbundle.zip"
-          ACTUAL_CHECKSUM=$(swift package compute-checksum \
-            bylaws-artifactbundle/bylaws.artifactbundle.zip)
-          swift run PackageManifestSync --check \
-            --plugin-url "${EXPECTED_URL}" \
-            --plugin-checksum "${ACTUAL_CHECKSUM}"
-          unzip -tq bylaws-artifactbundle/bylaws.artifactbundle.zip
-          unzip -p bylaws-artifactbundle/bylaws.artifactbundle.zip \
-            bylaws.artifactbundle/info.json > info.json
-          test "$(jq -r '.artifacts["bylaws-cli"].version' info.json)" = \
-            "${VERSION}"
-          test "$(jq -r '.artifacts["bylaws-lsp"].version' info.json)" = \
-            "${VERSION}"
-          jq -e '
-            .artifacts["bylaws-cli"].type == "executable"
-            and ([.artifacts["bylaws-cli"].variants[]
-              .supportedTriples[]] | sort) == [
-                "arm64-apple-macosx",
-                "x86_64-apple-macosx",
-                "x86_64-unknown-linux-gnu"
-              ]
-            and ([.artifacts["bylaws-cli"].variants[].path] | sort) == [
-              "linux/bin/bylaws",
-              "macos/bin/bylaws"
-            ]
-            and .artifacts["bylaws-lsp"].type == "executable"
-            and ([.artifacts["bylaws-lsp"].variants[]
-              .supportedTriples[]] | sort) == [
-                "arm64-apple-macosx",
-                "x86_64-apple-macosx",
-                "x86_64-unknown-linux-gnu"
-              ]
-            and ([.artifacts["bylaws-lsp"].variants[].path] | sort) == [
-              "linux/bin/bylaws-lsp",
-              "macos/bin/bylaws-lsp"
-            ]
-          ' info.json
-      - name: Commit and tag release
-        id: release-commit
-        env:
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          SOURCE_BRANCH: ${{ needs.prepare-source.outputs.source_branch }}
-          SOURCE_REVISION: ${{ needs.prepare-source.outputs.source_revision }}
-        run: |
-          git config user.name "${APP_SLUG}[bot]"
-          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
-          git add Package.swift
-          git commit -m "Release ${RELEASE_TAG} [skip ci]"
-          EXPECTED_REVISION=$(git rev-parse HEAD)
-          EXPECTED_TREE=$(git rev-parse HEAD^{tree})
-          git fetch origin main --tags
-          if git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}"; then
-            RELEASE_REVISION=$(git rev-parse "${RELEASE_TAG}^{commit}")
-            RELEASE_PARENT=$(git rev-parse "${RELEASE_REVISION}^")
-            RELEASE_TREE=$(git rev-parse "${RELEASE_REVISION}^{tree}")
-            if [ "${RELEASE_PARENT}" != "${SOURCE_REVISION}" ] || [ "${RELEASE_TREE}" != "${EXPECTED_TREE}" ]; then
-              git push origin --delete "${SOURCE_BRANCH}"
-              echo "::error::The ${RELEASE_TAG} tag belongs to another release."
-              exit 1
-            fi
-            if ! git merge-base --is-ancestor "${RELEASE_REVISION}" origin/main; then
-              git push origin --delete "${SOURCE_BRANCH}"
-              echo "::error::The ${RELEASE_TAG} tag is not on the main branch."
-              exit 1
-            fi
-          else
-            if [ "$(git rev-parse origin/main)" != "${GITHUB_SHA}" ]; then
-              git push origin --delete "${SOURCE_BRANCH}"
-              echo "::error::The main branch changed during the release. Run the workflow again."
-              exit 1
-            fi
-            RELEASE_REVISION="${EXPECTED_REVISION}"
-            git tag -a "${RELEASE_TAG}" -m "${RELEASE_TAG}"
-            git push --atomic origin HEAD:main "refs/tags/${RELEASE_TAG}"
-          fi
-          echo "revision=${RELEASE_REVISION}" >> "${GITHUB_OUTPUT}"
+          name: bylaws-aarch64-apple-darwin
+          path: out/bylaws-aarch64-apple-darwin.zip
+          if-no-files-found: error
+          retention-days: 7
 
-  draft-release:
-    name: Attest release archives
-    needs: prepare-release
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    # BCR's verifier requires a version tag for the reusable workflow.
-    uses: bazel-contrib/.github/.github/workflows/release_ruleset.yaml@v7.7.0
-    with:
-      tag_name: ${{ format('v{0}', inputs.version) }}
-      draft: true
-      prerelease: ${{ contains(inputs.version, '-') }}
-      mount_bazel_caches: false
-      # Package tests run in verify before the release tag is created.
-      bazel_test_command: bash -n .github/workflows/release_prep.sh
-      release_files: |
-        release-assets/bylaws.artifactbundle.zip
-        release-assets/bylaws-macos.tar.gz
-        release-assets/bylaws-linux.tar.gz
-        release-assets/bylaws-bazel-module.tar.gz
-
-  bazel-registry:
-    name: Publish Bazel module
-    needs: draft-release
-    if: >-
-      vars.BCR_PUBLISH_ENABLED == 'true'
-      && !contains(inputs.version, '-')
+  release:
+    name: Create pre-release
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: write
-      id-token: write
-      attestations: write
-    # BCR's verifier requires a version tag for the reusable workflow.
-    uses: bazel-contrib/publish-to-bcr/.github/workflows/publish.yaml@v1.5.1
-    with:
-      tag_name: ${{ format('v{0}', inputs.version) }}
-      registry_fork: theblixguy/bazel-central-registry
-      open_pull_request: false
-      attest: true
-      download_default_release_artifacts: true
-    secrets:
-      publish_token: ${{ secrets.BCR_PUBLISH_TOKEN }}
-
-  release:
-    name: Publish release
-    needs: [prepare-release, draft-release, bazel-registry]
-    if: >-
-      !cancelled()
-      && needs.prepare-release.result == 'success'
-      && needs.draft-release.result == 'success'
-      && (needs.bazel-registry.result == 'success' || needs.bazel-registry.result == 'skipped')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      revision: ${{ needs.prepare-release.outputs.revision }}
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
     steps:
-      - parallel:
-          - name: Check release attachments
-            env:
-              GH_TOKEN: ${{ github.token }}
-              BCR_PUBLISH_ENABLED: ${{ vars.BCR_PUBLISH_ENABLED }}
-            run: |
-              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-                --json tagName,assets > release.json
-              jq -e --arg tag "${RELEASE_TAG}" \
-                --arg bcr "${BCR_PUBLISH_ENABLED}" '
-                ["bylaws.artifactbundle.zip", "bylaws-macos.tar.gz",
-                 "bylaws-linux.tar.gz", "bylaws-bazel-module.tar.gz"] as $archives
-                | ($archives + [$archives[] + ".intoto.jsonl"]
-                  + (if $bcr == "true" and ($tag | contains("-") | not)
-                     then ["MODULE.bazel.intoto.jsonl", "source.json.intoto.jsonl"]
-                     else [] end)) as $required
-                | .tagName == $tag
-                  and (($required - [.assets[] | select(.size > 0) | .name]) | length == 0)
-              ' release.json
-          - name: Check out generated Bazel entry
-            if: needs.bazel-registry.result == 'success'
-            uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-            with:
-              repository: theblixguy/bazel-central-registry
-              ref: ${{ format('swift-bylaws-v{0}', inputs.version) }}
-              path: bazel-registry
-              sparse-checkout: modules/swift-bylaws
-              persist-credentials: false
-          - name: Install BCR verifier
-            if: needs.bazel-registry.result == 'success'
-            run: |
-              curl --fail --location --retry 3 --output slsa-verifier \
-                https://github.com/slsa-framework/slsa-verifier/releases/download/v2.7.1/slsa-verifier-linux-amd64
-              echo '946dbec729094195e88ef78e1734324a27869f03e2c6bd2f61cbc06bd5350339  slsa-verifier' | sha256sum --check
-              chmod +x slsa-verifier
-      - name: Verify Bazel attestations
-        if: needs.bazel-registry.result == 'success'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bylaws-aarch64-apple-darwin
+          path: dist
+
+      - name: Verify release inventory and checksums
         run: |
-          ENTRY="bazel-registry/modules/swift-bylaws/${RELEASE_TAG#v}"
-          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
-          ARCHIVE=bylaws-bazel-module.tar.gz
-          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-            --dir bcr-assets --pattern "${ARCHIVE}" --pattern '*.intoto.jsonl'
-          integrity() {
-            printf 'sha256-%s' "$(openssl dgst -sha256 -binary "$1" | openssl base64 -A)"
-          }
-          jq -e --arg url "${RELEASE_URL}/${ARCHIVE}" \
-            --arg integrity "$(integrity "bcr-assets/${ARCHIVE}")" \
-            '.url == $url and .integrity == $integrity' "${ENTRY}/source.json"
-          jq -e --arg archive "${ARCHIVE}" \
-            '.attestations | keys == (["source.json", "MODULE.bazel", $archive] | sort)' \
-            "${ENTRY}/attestations.json"
-          tar -xOf "bcr-assets/${ARCHIVE}" ./MODULE.bazel | cmp - "${ENTRY}/MODULE.bazel"
-          for file in source.json MODULE.bazel "${ARCHIVE}"; do
-            attestation="bcr-assets/${file}.intoto.jsonl"
-            jq -e --arg file "${file}" --arg url "${RELEASE_URL}/${file}.intoto.jsonl" \
-              --arg integrity "$(integrity "${attestation}")" \
-              '.attestations[$file] | .url == $url and .integrity == $integrity' \
-              "${ENTRY}/attestations.json"
-            if [ "${file}" = "${ARCHIVE}" ]; then
-              artifact="bcr-assets/${file}"
-              builder=https://github.com/bazel-contrib/.github/.github/workflows/release_ruleset.yaml
-            else
-              artifact="${ENTRY}/${file}"
-              builder=https://github.com/bazel-contrib/publish-to-bcr/.github/workflows/publish.yaml
-            fi
-            ./slsa-verifier verify-github-attestation \
-              --attestation-path "${attestation}" \
-              --source-uri "github.com/${GITHUB_REPOSITORY}" \
-              --builder-id "${builder}" "${artifact}"
-          done
-      - name: Publish release
+          test -f "dist/bylaws-$TRIPLE.zip"
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" -eq 1
+          test "$(unzip -Z -1 "dist/bylaws-$TRIPLE.zip")" = bylaws
+          (cd dist && sha256sum "bylaws-$TRIPLE.zip" > SHA256SUMS && sha256sum --check SHA256SUMS)
+
+      - name: Create tag at the triggering commit
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}"
-          --draft=false --title "${RELEASE_TAG}"
+          RELEASE_TAG: release-${{ github.sha }}
+        run: |
+          if gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag $RELEASE_TAG already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          gh api "repos/$REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$GITHUB_SHA"
 
-  clean-up:
-    name: Remove temporary branch
-    needs: [prepare-source, release]
-    if: ${{ !cancelled() && needs.release.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Remove branch
+      - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_BRANCH: ${{ needs.prepare-source.outputs.source_branch }}
-        run: >-
-          gh api --method DELETE
-          "repos/${GITHUB_REPOSITORY}/git/refs/heads/${SOURCE_BRANCH}"
-
-  publish-documentation:
-    name: Publish documentation
-    needs: release
-    if: ${{ !cancelled() && needs.release.result == 'success' && !contains(inputs.version, '-') }}
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy documentation
-        id: deployment
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
-
-  homebrew:
-    name: Update Homebrew formula
-    needs: release
-    if: ${{ !cancelled() && needs.release.result == 'success' && !contains(inputs.version, '-') }}
-    uses: ./.github/workflows/publish-homebrew.yml
-    with:
-      version: ${{ inputs.version }}
-      checkout_ref: ${{ needs.release.outputs.revision }}
-    secrets:
-      RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
-      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          RELEASE_TAG: release-${{ github.sha }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "dist/bylaws-$TRIPLE.zip" dist/SHA256SUMS \
+            --repo "$REPOSITORY" \
+            --prerelease \
+            --verify-tag \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "macOS arm64-only Bylaws CLI (no LSP), built from commit $GITHUB_SHA."
