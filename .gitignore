@@ -12,3 +12,5 @@ __pycache__/
 /Benchmarks/SwiftLintComparison.md
 /AGENTS.md
 /docs/audit-fixes.md
+node_modules/
+target/

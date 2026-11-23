@@ -6,8 +6,12 @@ on:
 permissions: {}
 
 concurrency:
-  group: release-${{ github.sha }}
-  cancel-in-progress: false
+  group: "${{ github.workflow }}-${{ github.head_ref || github.run_id }}"
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
 
 env:
   REPOSITORY: ${{ github.repository }}
@@ -17,13 +21,10 @@ env:
 jobs:
   preflight:
     name: Default branch only
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 5
     permissions:
       contents: read
-    defaults:
-      run:
-        shell: bash -euo pipefail {0}
     steps:
       - name: Refuse dispatches outside the default branch
         env:
@@ -42,11 +43,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-    defaults:
-      run:
-        shell: bash -euo pipefail {0}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -75,35 +73,33 @@ jobs:
           test "$(lipo -archs stage/bylaws)" = arm64
           file stage/bylaws
           ls -lh stage/bylaws
-          (cd stage && COPYFILE_DISABLE=1 zip -q -9 -X "../out/bylaws-$TRIPLE.zip" bylaws)
-          test "$(unzip -Z -1 "out/bylaws-$TRIPLE.zip")" = bylaws
+          COPYFILE_DISABLE=1 tar -cJf "out/bylaws-$TRIPLE.tar.xz" -C stage bylaws
+          test "$(tar -tJf "out/bylaws-$TRIPLE.tar.xz")" = bylaws
 
-      - name: Smoke-test the exact ZIP payload
+      - name: Smoke-test the exact archive payload
         run: |
           mkdir -p smoke
-          unzip -q "out/bylaws-$TRIPLE.zip" -d smoke
-          version="$(sed -n 's/.*current = "\([^"]*\)".*/\1/p' Sources/BylawsRunner/Project/BylawsVersion.swift)"
+          tar -xJf "out/bylaws-$TRIPLE.tar.xz" -C smoke
+          VERSION_FILE="Sources/BylawsRunner/Project/BylawsVersion.swift"
+          version="$(sed -n 's/.*current = "\([^"]*\)".*//p' "$VERSION_FILE")"
           test -n "$version"
           swift Scripts/test-release.swift "$PWD/smoke/bylaws" "$version"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bylaws-aarch64-apple-darwin
-          path: out/bylaws-aarch64-apple-darwin.zip
+          path: out/bylaws-aarch64-apple-darwin.tar.xz
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Create pre-release
     needs: [preflight, build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 10
     permissions:
       actions: read
       contents: write
-    defaults:
-      run:
-        shell: bash -euo pipefail {0}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -112,10 +108,10 @@ jobs:
 
       - name: Verify release inventory and checksums
         run: |
-          test -f "dist/bylaws-$TRIPLE.zip"
+          test -f "dist/bylaws-$TRIPLE.tar.xz"
           test "$(find dist -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" -eq 1
-          test "$(unzip -Z -1 "dist/bylaws-$TRIPLE.zip")" = bylaws
-          (cd dist && sha256sum "bylaws-$TRIPLE.zip" > SHA256SUMS && sha256sum --check SHA256SUMS)
+          test "$(tar -tJf "dist/bylaws-$TRIPLE.tar.xz")" = bylaws
+          (cd dist && sha256sum "bylaws-$TRIPLE.tar.xz" > SHA256SUMS && sha256sum --check SHA256SUMS)
 
       - name: Create tag at the triggering commit
         env:
@@ -129,16 +125,40 @@ jobs:
           gh api "repos/$REPOSITORY/git/refs" \
             -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$GITHUB_SHA"
 
+      - name: Write release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$RUNNER_TEMP/release-notes.md"
+          previous=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 \
+            --json tagName --jq '.[0].tagName // ""')
+          if [[ -z "$previous" ]]; then
+            printf 'Initial release at %s.\n' "$GITHUB_SHA" > "$notes"
+            exit 0
+          fi
+          compare="repos/$GITHUB_REPOSITORY/compare/$previous...$GITHUB_SHA"
+          status=$(gh api "$compare" --jq '.status')
+          if [[ "$status" != ahead ]]; then
+            printf 'Release notes rejected: %s is %s relative to %s, expected ahead\n' "$GITHUB_SHA" "$status" "$previous" >&2
+            exit 1
+          fi
+          {
+            printf '## Changes since %s\n\n' "$previous"
+            gh api --paginate "$compare?per_page=100" --jq '.commits[] | "- \(.sha[0:12]) \(.commit.message | split("\n")[0])"'
+            printf '\n**Full changelog**: %s/%s/compare/%s...%s\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$previous" "$GITHUB_SHA"
+          } > "$notes"
+
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: release-${{ github.sha }}
         run: |
           gh release create "$RELEASE_TAG" \
-            "dist/bylaws-$TRIPLE.zip" dist/SHA256SUMS \
+            "dist/bylaws-$TRIPLE.tar.xz" dist/SHA256SUMS \
             --repo "$REPOSITORY" \
             --prerelease \
             --verify-tag \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TAG" \
-            --notes "macOS arm64-only Bylaws CLI (no LSP), built from commit $GITHUB_SHA."
+            --notes-file "$RUNNER_TEMP/release-notes.md"
