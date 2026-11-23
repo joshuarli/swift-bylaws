@@ -10,6 +10,8 @@ struct BylawsCommand: AsyncParsableCommand {
     Keep project-wide rules in the root Bylaws.swift and add rules in
     subfolders where needed. You can run the same rules here, in CI
     or from a test target.
+
+    Maintained by Joshua Li: https://github.com/joshuarli/swift-bylaws
     """,
     version: BylawsVersion.current,
     subcommands: [

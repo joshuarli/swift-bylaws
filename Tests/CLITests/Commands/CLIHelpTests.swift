@@ -4,6 +4,12 @@ import Testing
 
 @Suite("CLI help")
 struct CLIHelpTests {
+  @Test("Top-level help identifies the maintainer")
+  func maintainer() {
+    let help = BylawsCommand.helpMessage(columns: 120)
+    #expect(help.contains("Maintained by Joshua Li: https://github.com/joshuarli/swift-bylaws"))
+  }
+
   @Test("Lint help shows common workflows")
   func lint() {
     let help = BylawsCommand.helpMessage(
