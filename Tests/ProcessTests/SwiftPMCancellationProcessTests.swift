@@ -84,11 +84,8 @@
           let toolPID = identifiers[0]
           let toolGroup = identifiers[1]
           try #require(toolPID > 0 && toolGroup == toolPID)
-          var toolStopped = false
           defer {
-            if !toolStopped {
-              _ = kill(-toolGroup, SIGKILL)
-            }
+            _ = kill(-toolGroup, SIGKILL)
           }
           let commandPID = try #require(await started.first { _ in true })
           let commandGroup = getpgid(commandPID)
@@ -100,10 +97,26 @@
           try await #require(throws: CancellationError.self) {
             try await commands.waitForAll()
           }
-          #expect(try await iterator.next() == "interrupted")
+          let deadline = Task {
+            do {
+              try await ContinuousClock().sleep(for: .seconds(5))
+              _ = kill(-toolGroup, SIGKILL)
+            } catch {
+              return
+            }
+          }
+          defer { deadline.cancel() }
+          let interrupt = try await iterator.next()
+          #if compiler(>=6.4)
+            // SwiftPM 6.4 can orphan build tools without forwarding SIGINT.
+            withKnownIssue("SwiftPM fails to interrupt its build tool") {
+              #expect(interrupt == "interrupted")
+            }
+          #else
+            #expect(interrupt == "interrupted")
+          #endif
           let end = try await iterator.next()
           try #require(end == nil)
-          toolStopped = true
         }
         try await readers.waitForAll()
       }
